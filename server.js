@@ -1,5 +1,7 @@
 require('dotenv').config();
 const express = require('express');
+const https = require('https');
+const fs = require('fs');
 const { WebSocketServer } = require('ws');
 const cors = require('cors');
 const { ethers } = require('ethers');
@@ -7,129 +9,121 @@ const { ethers } = require('ethers');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// Prevent Railway from closing long-lived WebSockets
+const server = https.createServer({
+  // Railway provides SSL automatically — no need for custom certs
+}, app);
+
+// Keep connections alive
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 120000;
+
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    connectedClients: clients.size,
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Start HTTP server
-const server = app.listen(PORT, () => {
-  console.log(`🚀 BlockVault Relay Server running on port ${PORT}`);
-});
-
 // WebSocket server
 const wss = new WebSocketServer({ server });
 
-// Store connected clients: Map<normalizedAddress, WebSocket>
+// Store active connections
 const clients = new Map();
 
-// Normalize wallet address using ethers checksum
+// Normalize wallet checksummed & lowercased
 function normalizeAddress(address) {
   if (!address) return null;
   try {
     return ethers.getAddress(address).toLowerCase();
-  } catch (error) {
-    console.error('Invalid address format:', address);
+  } catch {
     return null;
   }
 }
 
-// WebSocket connection handler
+// ✅ WebSocket connection handler
 wss.on('connection', (ws) => {
+  console.log("🟣 New client attempting WebSocket connection…");
   let walletAddress = null;
 
-  ws.on('message', (data) => {
-    try {
-      const message = JSON.parse(data.toString());
+  ws.on('open', () => {
+    console.log("✅ WebSocket fully open");
+  });
 
-      // Handle wallet registration
-      if (message.type === 'register' && message.walletAddress) {
-        walletAddress = normalizeAddress(message.walletAddress);
-        
-        if (walletAddress) {
-          clients.set(walletAddress, ws);
-          console.log(`✅ Registered wallet: ${walletAddress}`);
-          
-          // Send confirmation
-          ws.send(JSON.stringify({ 
-            type: 'registered', 
-            walletAddress: walletAddress 
-          }));
-        }
+  ws.on('message', (data) => {
+    let message;
+    try {
+      message = JSON.parse(data.toString());
+    } catch (err) {
+      console.error("Invalid JSON:", err);
+      return;
+    }
+
+    // ✅ Handle wallet registration
+    if (message.type === "register" && message.walletAddress) {
+      walletAddress = normalizeAddress(message.walletAddress);
+
+      if (!walletAddress) {
+        console.log("❌ Invalid wallet provided in register");
         return;
       }
 
-      // Handle message routing
-      if (message.type === 'message' && message.from && message.to) {
-        const fromAddress = normalizeAddress(message.from);
-        const toAddress = normalizeAddress(message.to);
+      clients.set(walletAddress, ws);
+      console.log(`✅ Wallet registered and live: ${walletAddress}`);
 
-        if (!fromAddress || !toAddress) {
-          console.error('Invalid addresses in message');
-          return;
-        }
+      ws.send(JSON.stringify({
+        type: "registered",
+        walletAddress,
+      }));
 
-        console.log(`📩 Routing message from ${fromAddress} to ${toAddress}`);
+      return;
+    }
 
-        const recipientWs = clients.get(toAddress);
-        
-        if (recipientWs && recipientWs.readyState === ws.OPEN) {
-          recipientWs.send(JSON.stringify(message));
-        } else {
-          console.log(`❌ Recipient not connected: ${toAddress}`);
-        }
+    // ✅ Message routing
+    if (message.to) {
+      const toAddress = normalizeAddress(message.to);
+      const recipient = clients.get(toAddress);
+
+      if (recipient && recipient.readyState === 1) {
+        message.timestamp = Date.now(); // Ensure client timestamp
+        recipient.send(JSON.stringify(message));
+        console.log(`📨 Routed ${message.type} to ${toAddress}`);
+      } else {
+        console.log(`⚠️ Recipient offline: ${toAddress}`);
       }
-
-      // Forward other message types (typing, presence, etc.)
-      if (message.to) {
-        const toAddress = normalizeAddress(message.to);
-        const recipientWs = clients.get(toAddress);
-        
-        if (recipientWs && recipientWs.readyState === ws.OPEN) {
-          recipientWs.send(JSON.stringify(message));
-        }
-      }
-
-    } catch (error) {
-      console.error('Error processing message:', error);
     }
   });
 
+  // ✅ Handle WebSocket disconnect
   ws.on('close', () => {
     if (walletAddress) {
       clients.delete(walletAddress);
-      console.log(`🔌 Disconnected wallet: ${walletAddress}`);
+      console.log(`🔌 Wallet disconnected: ${walletAddress}`);
     }
   });
 
-  ws.on('error', (error) => {
-    console.error('WebSocket error:', error);
+  ws.on('error', (err) => {
+    console.error("⚠️ WS Error:", err.message);
   });
 });
 
-// Cleanup disconnected clients every 30 seconds
+// ✅ Health monitoring
+app.get('/health', (req, res) => {
+  res.json({
+    status: "ok",
+    clients: clients.size,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ✅ Launch secure WebSocket server
+server.listen(PORT, () =>
+  console.log(`🚀 Secure BlockVault Relay running on :${PORT} (WSS enabled)`)
+);
+
+// 🧹 Clean stale clients
 setInterval(() => {
-  clients.forEach((ws, address) => {
-    if (ws.readyState !== ws.OPEN) {
-      clients.delete(address);
-      console.log(`🧹 Cleaned up disconnected wallet: ${address}`);
+  clients.forEach((ws, addr) => {
+    if (ws.readyState !== 1) {
+      clients.delete(addr);
+      console.log(`🧹 Cleaned stale: ${addr}`);
     }
   });
 }, 30000);
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, closing server...');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
-});
