@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const https = require('https');
-const fs = require('fs');
+const http = require('http');
 const { WebSocketServer } = require('ws');
 const cors = require('cors');
 const { ethers } = require('ethers');
@@ -9,102 +8,35 @@ const { ethers } = require('ethers');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Prevent Railway from closing long-lived WebSockets
-const server = https.createServer({
-  // Railway provides SSL automatically — no need for custom certs
-}, app);
-
-// Keep connections alive
-server.keepAliveTimeout = 120000;
-server.headersTimeout = 120000;
-
 // Middleware
 app.use(cors());
 app.use(express.json());
 
+// Create HTTP server (Railway auto upgrades to HTTPS/WSS)
+const server = http.createServer(app);
+
+// Prevent Railway from closing active WebSockets
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 120000;
+
 // WebSocket server
 const wss = new WebSocketServer({ server });
 
-// Store active connections
+// Active connected clients: Map<normalizedWallet, WebSocket>
 const clients = new Map();
 
-// Normalize wallet checksummed & lowercased
+// Normalize using ethers for case + checksum
 function normalizeAddress(address) {
   if (!address) return null;
   try {
     return ethers.getAddress(address).toLowerCase();
   } catch {
+    console.warn("Invalid address:", address);
     return null;
   }
 }
 
-// ✅ WebSocket connection handler
-wss.on('connection', (ws) => {
-  console.log("🟣 New client attempting WebSocket connection…");
-  let walletAddress = null;
-
-  ws.on('open', () => {
-    console.log("✅ WebSocket fully open");
-  });
-
-  ws.on('message', (data) => {
-    let message;
-    try {
-      message = JSON.parse(data.toString());
-    } catch (err) {
-      console.error("Invalid JSON:", err);
-      return;
-    }
-
-    // ✅ Handle wallet registration
-    if (message.type === "register" && message.walletAddress) {
-      walletAddress = normalizeAddress(message.walletAddress);
-
-      if (!walletAddress) {
-        console.log("❌ Invalid wallet provided in register");
-        return;
-      }
-
-      clients.set(walletAddress, ws);
-      console.log(`✅ Wallet registered and live: ${walletAddress}`);
-
-      ws.send(JSON.stringify({
-        type: "registered",
-        walletAddress,
-      }));
-
-      return;
-    }
-
-    // ✅ Message routing
-    if (message.to) {
-      const toAddress = normalizeAddress(message.to);
-      const recipient = clients.get(toAddress);
-
-      if (recipient && recipient.readyState === 1) {
-        message.timestamp = Date.now(); // Ensure client timestamp
-        recipient.send(JSON.stringify(message));
-        console.log(`📨 Routed ${message.type} to ${toAddress}`);
-      } else {
-        console.log(`⚠️ Recipient offline: ${toAddress}`);
-      }
-    }
-  });
-
-  // ✅ Handle WebSocket disconnect
-  ws.on('close', () => {
-    if (walletAddress) {
-      clients.delete(walletAddress);
-      console.log(`🔌 Wallet disconnected: ${walletAddress}`);
-    }
-  });
-
-  ws.on('error', (err) => {
-    console.error("⚠️ WS Error:", err.message);
-  });
-});
-
-// ✅ Health monitoring
+// Health endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: "ok",
@@ -113,17 +45,73 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ✅ Launch secure WebSocket server
-server.listen(PORT, () =>
-  console.log(`🚀 Secure BlockVault Relay running on :${PORT} (WSS enabled)`)
-);
+// Handle WebSocket connections
+wss.on('connection', (ws) => {
+  console.log("🟣 New WS connection...");
+  let walletAddress = null;
 
-// 🧹 Clean stale clients
+  ws.on('message', (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch (err) {
+      console.error("❌ Invalid JSON:", err);
+      return;
+    }
+
+    // ✅ Registration event
+    if (msg.type === "register" && msg.walletAddress) {
+      walletAddress = normalizeAddress(msg.walletAddress);
+      if (!walletAddress) return;
+
+      clients.set(walletAddress, ws);
+      console.log(`✅ Registered: ${walletAddress}`);
+
+      ws.send(JSON.stringify({
+        type: "registered",
+        walletAddress,
+      }));
+      return;
+    }
+
+    // ✅ Routing for all chat/call/typing events
+    if (msg.to) {
+      const toAddress = normalizeAddress(msg.to);
+      const recipient = clients.get(toAddress);
+
+      if (recipient && recipient.readyState === recipient.OPEN) {
+        msg.timestamp = msg.timestamp || Date.now();
+        recipient.send(JSON.stringify(msg));
+        console.log(`📨 Routed ${msg.type} → ${toAddress}`);
+      } else {
+        console.log(`⚠️ Recipient not connected: ${toAddress}`);
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    if (walletAddress) {
+      clients.delete(walletAddress);
+      console.log(`🔌 Disconnected: ${walletAddress}`);
+    }
+  });
+
+  ws.on('error', (err) => {
+    console.error("⚠️ WS Error:", err.message);
+  });
+});
+
+// Cleanup dead clients
 setInterval(() => {
   clients.forEach((ws, addr) => {
-    if (ws.readyState !== 1) {
+    if (ws.readyState !== ws.OPEN) {
       clients.delete(addr);
-      console.log(`🧹 Cleaned stale: ${addr}`);
+      console.log(`🧹 Cleanup ghost: ${addr}`);
     }
   });
 }, 30000);
+
+// Start server ✅
+server.listen(PORT, () =>
+  console.log(`🚀 Relay Server running on :${PORT} (WS supported)`)
+);
